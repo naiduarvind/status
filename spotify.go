@@ -1,47 +1,67 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"log"
-	"os"
+	"net/http"
 
 	"github.com/zmb3/spotify"
-	"golang.org/x/oauth2/clientcredentials"
 )
 
-var userID = flag.String("user", "1228356253", "the Spotify user ID to look up")
+const redirectURI = "http://localhost:8080/callback"
+
+var (
+	auth  = spotify.NewAuthenticator(redirectURI, spotify.ScopeUserReadRecentlyPlayed)
+	ch    = make(chan *spotify.Client)
+	state = "abc123"
+)
 
 func main() {
-	flag.Parse()
+	var client *spotify.Client
 
-	if *userID == "" {
-		fmt.Fprintf(os.Stderr, "Error: missing user ID\n")
-		flag.Usage()
-		return
-	}
+	http.HandleFunc("/callback", completeAuth)
 
-	config := &clientcredentials.Config{
-		ClientID:     os.Getenv("SPOTIFY_CLIENT_ID"),
-		ClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
-		TokenURL:     spotify.TokenURL,
-	}
-	token, err := config.Token(context.Background())
+	go func() {
+		url := auth.AuthURL(state)
+		fmt.Println("Please log in to Spotify by visiting the following page in your browser:", url)
+
+		// wait for auth to complete
+		client = <-ch
+
+		// use the client to make calls that require authorization
+		user, err := client.CurrentUser()
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("You are logged in as:", user.ID)
+
+		recentlyPlayedConfig := &spotify.RecentlyPlayedOptions{
+			Limit: 5,
+		}
+
+		recentlyPlayed, err := client.PlayerRecentlyPlayedOpt(recentlyPlayedConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Found your %s\n", recentlyPlayed)
+	}()
+
+	http.ListenAndServe(":8080", nil)
+}
+
+func completeAuth(w http.ResponseWriter, r *http.Request) {
+	tok, err := auth.Token(state, r)
 	if err != nil {
-		log.Fatalf("couldn't get token: %v", err)
+		http.Error(w, "Couldn't get token", http.StatusForbidden)
+		log.Fatal(err)
 	}
-
-	client := spotify.Authenticator{}.NewClient(token)
-	user, err := client.GetUsersPublicProfile(spotify.ID(*userID))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		return
+	if st := r.FormValue("state"); st != state {
+		http.NotFound(w, r)
+		log.Fatalf("State mismatch: %s != %s\n", st, state)
 	}
-
-	fmt.Println("User ID:", user.ID)
-	fmt.Println("Display name:", user.DisplayName)
-	fmt.Println("Spotify URI:", string(user.URI))
-	fmt.Println("Endpoint:", user.Endpoint)
-	fmt.Println("Followers:", user.Followers.Count)
+	// use the token to get an authenticated client
+	client := auth.NewClient(tok)
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, "Login Completed!")
+	ch <- &client
 }
